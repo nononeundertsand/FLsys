@@ -1,3 +1,4 @@
+import os
 import socket
 import threading
 import struct
@@ -39,6 +40,25 @@ class FLServer:
         # 初始化全局模型
         self.global_model = get_model(self.train_config['model_name']).to(self.device)
         self.client_weights = [] # 存储本轮上传的参数 [(state_dict, n_samples), ...]
+
+        # --- [新增] 初始化 Checkpoint 目录 ---
+        # 命名格式: <数据集>-<模型>-<算法>-<客户端数>-<Alpha>-<总轮次>-checkpoint
+        dir_name = (
+            f"{self.config['dataset']['name']}-"
+            f"{self.train_config['model_name']}-"
+            f"{self.train_config['algorithm']}-"
+            f"{self.target_clients}-"
+            f"{self.config['dataset']['alpha']}-"
+            f"{self.train_config['global_epochs']}-checkpoint"
+        )
+        # 将其放在 server 目录下的 saved_models 文件夹内，保持整洁
+        self.checkpoint_dir = os.path.join(os.path.dirname(__file__), 'saved_models', dir_name)
+        
+        if not os.path.exists(self.checkpoint_dir):
+            os.makedirs(self.checkpoint_dir)
+            print(f"[*] 创建模型保存目录: {self.checkpoint_dir}")
+        else:
+            print(f"[*] 模型保存目录: {self.checkpoint_dir}")
 
     def _send_msg(self, conn, msg_type, payload=None):
         """发送JSON控制指令"""
@@ -231,11 +251,10 @@ class FLServer:
         print(f"[Agg] 聚合完成 (Total Samples: {total_samples})")
 
 
-    def evaluate_global_model(self):
-        """[新增] 在服务器端测试集上评估全局模型"""
-        self.global_model.eval() # 切换到评估模式
+    def evaluate_global_model(self, current_epoch):
+        """[修改] 评估并在服务器端保存最佳模型"""
+        self.global_model.eval()
         
-        # 创建DataLoader
         test_loader = torch.utils.data.DataLoader(
             self.test_dataset, 
             batch_size=self.train_config['batch_size'], 
@@ -247,9 +266,9 @@ class FLServer:
         total_loss = 0.0
         criterion = torch.nn.CrossEntropyLoss()
         
-        print(f"[Eval] 正在评估全局模型 (测试集大小: {len(self.test_dataset)})...")
+        print(f"[Eval] 正在评估全局模型 (测试集: {len(self.test_dataset)})...")
         
-        with torch.no_grad(): # 不计算梯度，节省显存
+        with torch.no_grad():
             for data, target in test_loader:
                 data, target = data.to(self.device), target.to(self.device)
                 outputs = self.global_model(data)
@@ -263,10 +282,21 @@ class FLServer:
         acc = 100. * correct / total
         avg_loss = total_loss / len(test_loader)
         
-        print(f"[Eval] 结果: Loss={avg_loss:.4f} | Accuracy={acc:.2f}%")
-        print("-" * 50)
+        print(f"[Eval] Epoch {current_epoch} 结果: Loss={avg_loss:.4f} | Accuracy={acc:.2f}%")
         
-        self.global_model.train() # 切回训练模式，以免影响后续可能的训练操作
+        # --- [新增] 保存模型 Checkpoint ---
+        # 文件名格式: global_acc_85.23.pth
+        file_name = f"global_acc_{acc:.2f}.pth"
+        save_path = os.path.join(self.checkpoint_dir, file_name)
+        
+        try:
+            torch.save(self.global_model.state_dict(), save_path)
+            print(f"[Save] 模型已保存: {file_name}")
+        except Exception as e:
+            print(f"[Err] 模型保存失败: {e}")
+
+        print("-" * 50)
+        self.global_model.train()
 
     def start_training_loop(self):
         """主训练循环"""
@@ -300,8 +330,8 @@ class FLServer:
             if self.train_config['algorithm'] == 'FedAvg':
                 self.fedavg_aggregate()
 
-            # 5. [新增] 评估全局模型
-            self.evaluate_global_model()
+            # 5. [修改] 传入当前 epoch
+            self.evaluate_global_model(epoch)
                 
         print("\n[Done] 全部训练结束！")
 

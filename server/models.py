@@ -34,7 +34,7 @@ class SmallCNN(nn.Module):
 
 def get_model(name):
     """根据配置名称获取模型实例"""
-    if name == 'SmallCNN':
+    if name == 'SmallCNN_FashionMNIST':
         return SmallCNN()
     else:
         raise ValueError(f"未定义的模型: {name}")

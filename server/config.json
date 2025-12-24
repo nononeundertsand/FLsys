@@ -7,7 +7,7 @@
         "alpha": 0.5
     },
     "training": {
-        "model_name": "SmallCNN",
+        "model_name": "SmallCNN_FashionMNIST",
         "algorithm": "FedAvg",
         "global_epochs": 10,
         "local_epochs": 3,
