@@ -4,7 +4,16 @@
     "target_clients": 1,
     "dataset": {
         "name": "FashionMNIST",
-        "alpha": 0.5,
-        "batch_size": 32
+        "alpha": 0.5
+    },
+    "training": {
+        "model_name": "SmallCNN",
+        "algorithm": "FedAvg",
+        "global_epochs": 10,
+        "local_epochs": 3,
+        "batch_size": 32,
+        "lr": 0.01,
+        "momentum": 0.9,
+        "device": "cpu" 
     }
 }

@@ -2,54 +2,89 @@ import socket
 import threading
 import struct
 import json
-import pickle  # [新增] 用于序列化对象
+import pickle
 import traceback
-import data_utils # [新增]
+import copy
+import time
+import torch
+import data_utils
+from models import get_model
 
 class FLServer:
     def __init__(self, config):
         self.config = config
+        self.train_config = config['training']
         self.host = config['host']
         self.port = config['port']
         self.target_clients = config['target_clients']
         
+        # 客户端状态管理
+        # 结构: {addr: {'id': str, 'conn': socket, 'samples': int}}
         self.clients = {} 
-        self.lock = threading.Lock()
-        self.ready_event = threading.Event()
-        # 用于等待ACK的计数器
-        self.ack_count = 0
-        self.ack_event = threading.Event()
         
+        # 线程同步工具
+        self.lock = threading.Lock()
+        self.ready_event = threading.Event()  # 注册满员事件
+        self.ack_event = threading.Event()    # 通用ACK事件
+        self.ack_count = 0
+        
+        # 网络 socket
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        # 存放数据
-        self.test_dataset = None
+        # 联邦学习相关
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[*] 服务器运行设备: {self.device}")
+        
+        # 初始化全局模型
+        self.global_model = get_model(self.train_config['model_name']).to(self.device)
+        self.client_weights = [] # 存储本轮上传的参数 [(state_dict, n_samples), ...]
 
     def _send_msg(self, conn, msg_type, payload=None):
-        """发送控制消息(JSON)"""
-        data = {"type": msg_type}
-        if payload: data.update(payload)
-        js = json.dumps(data).encode('utf-8')
-        conn.sendall(struct.pack('>I', len(js)) + js)
+        """发送JSON控制指令"""
+        try:
+            data = {"type": msg_type}
+            if payload: data.update(payload)
+            js = json.dumps(data).encode('utf-8')
+            conn.sendall(struct.pack('>I', len(js)) + js)
+        except Exception as e:
+            print(f"[错误] 发送消息失败: {e}")
 
     def _send_data(self, conn, data_obj):
-        """发送大数据对象(Pickle)"""
-        # 1. 序列化
-        serialized = pickle.dumps(data_obj)
-        # 2. 发送长度头 (4字节) + 内容
-        conn.sendall(struct.pack('>I', len(serialized)) + serialized)
+        """发送二进制大对象(Pickle)"""
+        try:
+            serialized = pickle.dumps(data_obj)
+            conn.sendall(struct.pack('>I', len(serialized)) + serialized)
+        except Exception as e:
+            print(f"[错误] 发送数据失败: {e}")
 
     def _recv_json(self, conn):
+        """接收JSON控制指令"""
         header = conn.recv(4)
         if not header: return None
         length = struct.unpack('>I', header)[0]
         data = b''
         while len(data) < length:
-            data += conn.recv(length - len(data))
+            chunk = conn.recv(length - len(data))
+            if not chunk: return None
+            data += chunk
         return json.loads(data.decode('utf-8'))
 
+    def _recv_object(self, conn):
+        """接收二进制大对象(Pickle)"""
+        header = conn.recv(4)
+        if not header: return None
+        length = struct.unpack('>I', header)[0]
+        data = b''
+        # 64KB 缓冲区
+        while len(data) < length:
+            chunk = conn.recv(min(length - len(data), 65536))
+            if not chunk: break
+            data += chunk
+        return pickle.loads(data)
+
     def _handle_client(self, conn, addr):
+        """处理单个客户端的通信线程"""
         print(f"[连接] {addr} 接入")
         client_id = "Unknown"
         try:
@@ -59,27 +94,43 @@ class FLServer:
                 
                 msg_type = req.get('type')
 
-                # --- 注册 ---
+                # --- 1. 注册请求 ---
                 if msg_type == 'register':
                     client_id = req.get('client_id')
                     with self.lock:
                         self.clients[addr] = {'id': client_id, 'conn': conn}
-                        print(f"[注册] {client_id} ({addr}) | {len(self.clients)}/{self.target_clients}")
+                        current_count = len(self.clients)
+                        print(f"[注册] {client_id} ({addr}) | 进度: {current_count}/{self.target_clients}")
+                        
                         self._send_msg(conn, "success", {"msg": "注册成功"})
                         
-                        if len(self.clients) >= self.target_clients:
+                        if current_count >= self.target_clients:
                             self.ready_event.set()
 
-                # --- 数据接收确认 (ACK) ---
+                # --- 2. 数据接收确认 (ACK) ---
                 elif msg_type == 'data_ack':
                     with self.lock:
                         self.ack_count += 1
-                        print(f"[ACK] 收到 {client_id} 数据接收确认 ({self.ack_count}/{self.target_clients})")
+                        print(f"[ACK] {client_id} 数据准备就绪 ({self.ack_count}/{self.target_clients})")
                         if self.ack_count >= self.target_clients:
                             self.ack_event.set()
                 
+                # --- 3. 接收模型更新 ---
+                elif msg_type == 'client_update':
+                    print(f"[接收] 收到 {client_id} 的梯度更新...")
+                    # 紧接着读取权重数据
+                    weights = self._recv_object(conn)
+                    samples = req.get('samples')
+                    
+                    with self.lock:
+                        self.client_weights.append((weights, samples))
+                        self.ack_count += 1
+                        print(f"[进度] 本轮已收集: {self.ack_count}/{self.target_clients}")
+                        if self.ack_count >= self.target_clients:
+                            self.ack_event.set()
+
         except Exception:
-            print(f"[!] 客户端 {client_id} 异常:")
+            print(f"[!] 客户端 {client_id} 异常断开")
             traceback.print_exc()
         finally:
             with self.lock:
@@ -88,69 +139,129 @@ class FLServer:
             conn.close()
 
     def start_listen(self):
-        # (同上一步，保持不变，省略以节省空间)
+        """启动监听线程"""
         try:
             self.sock.bind((self.host, self.port))
             self.sock.listen(5)
-            t = threading.Thread(target=self._accept_loop)
+            print(f"[*] Server 启动 | 端口: {self.port} | 目标客户端: {self.target_clients}")
+            
+            def accept_loop():
+                while True:
+                    try:
+                        conn, addr = self.sock.accept()
+                        t = threading.Thread(target=self._handle_client, args=(conn, addr))
+                        t.daemon = True
+                        t.start()
+                    except OSError: break
+            
+            t = threading.Thread(target=accept_loop)
             t.daemon = True
             t.start()
-        except Exception: traceback.print_exc()
-
-    def _accept_loop(self):
-        while True:
-            try:
-                conn, addr = self.sock.accept()
-                t = threading.Thread(target=self._handle_client, args=(conn, addr))
-                t.daemon = True
-                t.start()
-            except: break
+        except Exception:
+            traceback.print_exc()
 
     def wait_for_ready(self):
+        """阻塞直到客户端注册满员"""
         print("[*] 等待客户端注册...")
         self.ready_event.wait()
         print("[√] 客户端集结完毕")
 
     def distribute_dataset(self):
-        """执行数据划分与分发"""
+        """数据划分与分发"""
         ds_config = self.config['dataset']
-        print(f"\n[*] 开始数据初始化阶段: {ds_config['name']} (Alpha={ds_config['alpha']})")
+        print(f"\n[*] 初始化数据: {ds_config['name']} (Alpha={ds_config['alpha']})")
         
-        # 1. 加载和划分数据
-        train_ds, test_ds = data_utils.get_dataset(ds_config['name'])
-        self.test_dataset = test_ds # 服务器保留测试集
-        
-        # 获取划分索引
+        # 获取数据和划分索引
+        train_ds, _ = data_utils.get_dataset(ds_config['name'])
         client_addrs = list(self.clients.keys())
         partition_indices = data_utils.dirichlet_partition(train_ds, len(client_addrs), ds_config['alpha'])
         
-        # 2. 分发给客户端
-        self.ack_count = 0 
+        # 重置ACK计数器
+        self.ack_count = 0
         self.ack_event.clear()
         
-        print("[*] 开始向客户端发送数据分块...")
-        
+        print("[*] 开始分发数据分块...")
         for i, addr in enumerate(client_addrs):
             conn = self.clients[addr]['conn']
             indices = partition_indices[i]
             
-            # 构建发送的数据包：包含数据集配置和具体的数据索引
-            # 注意：为了节省带宽，我们只发送索引(Indices)，客户端自己下载原始数据然后提取。
-            # 或者：如果树莓派不能联网下载，我们需要发送真实的 Image/Tensor 数据。
-            # 策略：这里演示直接发送真实 Tensor 数据 (Subset)，确保树莓派无需联网下载数据集。
-            
-            # 提取子集数据
+            # 提取真实数据 (Subset -> Tensor List)
             local_data = [train_ds[idx] for idx in indices]
             
-            # 发送控制指令
+            # 发送 header 和 data
             self._send_msg(conn, "start_data_sync", {"data_len": len(local_data)})
-            # 发送实体数据
             self._send_data(conn, local_data)
             
-        # 3. 等待所有客户端确认
-        print("[*] 数据发送完毕，等待客户端确认(ACK)...")
+        print("[Wait] 等待客户端接收数据...")
         self.ack_event.wait()
-        print("[√] 数据初始化阶段完成！所有客户端已接收数据。\n")
+        print("[√] 数据分发完成\n")
+
+    def sync_training_config(self):
+        """同步训练配置"""
+        print("[*] 同步训练配置...")
+        for addr in self.clients:
+            self._send_msg(self.clients[addr]['conn'], "init_config", self.train_config)
+        time.sleep(1) # 简单缓冲
+        print("[√] 配置同步完成")
+
+    def fedavg_aggregate(self):
+        """FedAvg 聚合算法"""
+        print("[Agg] 开始聚合参数...")
+        if not self.client_weights: return
+
+        total_samples = sum([n for _, n in self.client_weights])
+        base_weights = self.client_weights[0][0]
+        avg_weights = copy.deepcopy(base_weights)
+        
+        # 清空基础权重
+        for key in avg_weights.keys():
+            avg_weights[key] = torch.zeros_like(avg_weights[key], dtype=torch.float32)
+
+        # 加权累加
+        for weights, n_samples in self.client_weights:
+            factor = n_samples / total_samples
+            for key in weights.keys():
+                # 确保在CPU上运算
+                avg_weights[key] += weights[key] * factor
+
+        # 更新全局模型
+        self.global_model.load_state_dict(avg_weights)
+        self.client_weights = [] # 清空缓存
+        print(f"[Agg] 聚合完成 (Total Samples: {total_samples})")
+
+    def start_training_loop(self):
+        """主训练循环"""
+        epochs = self.train_config['global_epochs']
+        print(f"\n{'='*20} 开始联邦训练 {'='*20}")
+        
+        for epoch in range(1, epochs + 1):
+            print(f"\n>>> Global Round {epoch}/{epochs} <<<")
+            
+            # 重置本轮ACK
+            self.ack_count = 0
+            self.ack_event.clear()
+            
+            # 1. 获取全局参数 (转为CPU发送，兼容树莓派)
+            global_weights = self.global_model.state_dict()
+            global_weights_cpu = {k: v.cpu() for k, v in global_weights.items()}
+            
+            # 2. 广播参数
+            print("[BroadCast] 分发全局模型...")
+            # 使用 list(keys) 防止迭代中字典变化
+            for addr in list(self.clients.keys()):
+                conn = self.clients[addr]['conn']
+                self._send_msg(conn, "start_round", {"epoch": epoch})
+                self._send_data(conn, global_weights_cpu)
+            
+            # 3. 等待更新
+            print("[Wait] 等待客户端训练...")
+            self.ack_event.wait()
+            
+            # 4. 聚合
+            if self.train_config['algorithm'] == 'FedAvg':
+                self.fedavg_aggregate()
+                
+        print("\n[Done] 全部训练结束！")
 
     def cleanup(self):
         self.sock.close()
