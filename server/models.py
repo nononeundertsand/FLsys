@@ -1,3 +1,8 @@
+"""
+server.models 的 Docstring
+该文件需要和client中的 models.py 保持同步更新
+"""
+
 import torch
 import torch.nn as nn
 

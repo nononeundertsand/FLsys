@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from models import get_model
+from algorithms import get_algorithm
 
 class FLClient:
     def __init__(self, config):
@@ -26,6 +27,7 @@ class FLClient:
         self.device = torch.device("cpu") # 树莓派使用CPU
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = None
+        self.client_algo = None # [新增]
 
     def _send_msg(self, msg_type, payload=None):
         """发送JSON消息"""
@@ -93,54 +95,57 @@ class FLClient:
         
         self.model = get_model(config['model_name']).to(self.device)
         
-        lr = config.get('lr', 0.01)
-        momentum = config.get('momentum', 0.9)
-        self.optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=momentum)
-        print("[√] 模型就绪")
+        # lr = config.get('lr', 0.01)
+        # momentum = config.get('momentum', 0.9)
+        # self.optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=momentum)
+        # print("[√] 模型就绪")
+        # [修改] 获取对应算法的客户端实现
+        _, self.client_algo = get_algorithm(config['algorithm'])
+        print(f"[*] 算法策略已加载: {self.client_algo.__class__.__name__}")
 
-    def local_train(self, global_weights):
-        """执行本地训练 (带进度显示)"""
-        # 1. 加载全局参数
-        self.model.load_state_dict(global_weights)
-        self.model.train()
+    # def local_train(self, global_weights):
+    #     """执行本地训练 (带进度显示)"""
+    #     # 1. 加载全局参数
+    #     self.model.load_state_dict(global_weights)
+    #     self.model.train()
         
-        # 2. 准备数据
-        train_loader = DataLoader(self.local_dataset, 
-                                  batch_size=self.train_config['batch_size'], 
-                                  shuffle=True)
+    #     # 2. 准备数据
+    #     train_loader = DataLoader(self.local_dataset, 
+    #                               batch_size=self.train_config['batch_size'], 
+    #                               shuffle=True)
         
-        epochs = self.train_config['local_epochs']
-        print(f"[*] 开始本地训练 ({epochs} Epochs)...")
+    #     epochs = self.train_config['local_epochs']
+    #     print(f"[*] 开始本地训练 ({epochs} Epochs)...")
         
-        for epoch in range(epochs):
-            total_loss = 0.0
-            correct = 0
-            total = 0
+    #     for epoch in range(epochs):
+    #         total_loss = 0.0
+    #         correct = 0
+    #         total = 0
             
-            # 使用 sys.stdout 打印动态进度条 (可选) 或者直接打印 Epoch 结果
-            # 这里为了简约高效，我们打印每个Epoch的详细统计
-            for batch_idx, (data, target) in enumerate(train_loader):
-                data, target = data.to(self.device), target.to(self.device)
+    #         # 使用 sys.stdout 打印动态进度条 (可选) 或者直接打印 Epoch 结果
+    #         # 这里为了简约高效，我们打印每个Epoch的详细统计
+    #         for batch_idx, (data, target) in enumerate(train_loader):
+    #             data, target = data.to(self.device), target.to(self.device)
                 
-                self.optimizer.zero_grad()
-                output = self.model(data)
-                loss = self.criterion(output, target)
-                loss.backward()
-                self.optimizer.step()
+    #             self.optimizer.zero_grad()
+    #             output = self.model(data)
+    #             loss = self.criterion(output, target)
+    #             loss.backward()
+    #             self.optimizer.step()
                 
-                # 统计
-                total_loss += loss.item()
-                _, predicted = output.max(1)
-                total += target.size(0)
-                correct += predicted.eq(target).sum().item()
+    #             # 统计
+    #             total_loss += loss.item()
+    #             _, predicted = output.max(1)
+    #             total += target.size(0)
+    #             correct += predicted.eq(target).sum().item()
             
-            # 计算本Epoch的平均指标
-            avg_loss = total_loss / len(train_loader)
-            acc = 100. * correct / total
+    #         # 计算本Epoch的平均指标
+    #         avg_loss = total_loss / len(train_loader)
+    #         acc = 100. * correct / total
             
-            print(f"    [Epoch {epoch+1}/{epochs}] Loss: {avg_loss:.4f} | Acc: {acc:.2f}%")
+    #         print(f"    [Epoch {epoch+1}/{epochs}] Loss: {avg_loss:.4f} | Acc: {acc:.2f}%")
 
-        return self.model.state_dict()
+    #     return self.model.state_dict()
 
     def _wait_for_instruction(self):
         """主循环：等待并执行服务器指令"""
@@ -172,9 +177,15 @@ class FLClient:
                 # A. 接收全局参数
                 global_weights = self._recv_object()
                 
-                # B. 本地训练
-                if self.train_config['algorithm'] == 'FedAvg':
-                    updated_weights = self.local_train(global_weights)
+                # B. [修改] 使用策略类进行训练
+                # 将训练所需的所有资源传给算法类
+                updated_weights = self.client_algo.train(
+                    model=self.model,
+                    dataset=self.local_dataset,
+                    config=self.train_config,
+                    device=self.device,
+                    global_weights=global_weights
+                )
                 
                 # C. 上传参数
                 print("[*] 上传模型更新...")

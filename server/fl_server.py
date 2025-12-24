@@ -10,6 +10,7 @@ import time
 import torch
 import data_utils
 from models import get_model
+from algorithms import get_algorithm
 
 class FLServer:
     def __init__(self, config):
@@ -40,6 +41,9 @@ class FLServer:
         # 初始化全局模型
         self.global_model = get_model(self.train_config['model_name']).to(self.device)
         self.client_weights = [] # 存储本轮上传的参数 [(state_dict, n_samples), ...]
+
+        self.server_algo, _ = get_algorithm(self.train_config['algorithm'])
+        print(f"[*] 联邦算法策略: {self.train_config['algorithm']}")
 
         # --- [新增] 初始化 Checkpoint 目录 ---
         # 命名格式: <数据集>-<模型>-<算法>-<客户端数>-<Alpha>-<总轮次>-checkpoint
@@ -187,29 +191,63 @@ class FLServer:
         print("[√] 客户端集结完毕")
 
     def distribute_dataset(self):
-        """数据划分与分发"""
+        """数据划分与分发 (支持不等分逻辑)"""
         ds_config = self.config['dataset']
-        print(f"\n[*] 初始化数据: {ds_config['name']} (Alpha={ds_config['alpha']})")
         
-        # 获取数据和划分索引
+        # 1. 获取配置参数
+        # 如果config没写num_partitions，默认就等于客户端数量
+        n_partitions = ds_config.get('num_partitions', self.target_clients)
+        strict_mode = ds_config.get('require_equal_partitions', True)
+        
+        print(f"\n[*] 初始化数据: {ds_config['name']} (Alpha={ds_config['alpha']})")
+        print(f"[*] 分区策略: 计划切分 {n_partitions} 块 | 实际客户端 {self.target_clients} 个 | 严格模式: {strict_mode}")
+
+        # 2. 逻辑校验
+        if strict_mode:
+            if n_partitions != self.target_clients:
+                raise ValueError(
+                    f"[Config Error] 严格模式开启: 数据分区数({n_partitions}) 必须等于 客户端数量({self.target_clients})。"
+                    f"请修改 config.json 或设置 require_equal_partitions 为 false。"
+                )
+        else:
+            if self.target_clients > n_partitions:
+                raise ValueError(
+                    f"[Config Error] 客户端数量({self.target_clients}) 多于 数据分区数({n_partitions})，无法分配数据！"
+                )
+            elif self.target_clients < n_partitions:
+                print(f"\n{'!'*50}")
+                print(f"[Warning] 注意：客户端数量 ({self.target_clients}) 小于 数据分区数 ({n_partitions})")
+                print(f"          系统将从 {n_partitions} 个数据块中选取前 {self.target_clients} 个进行分发。")
+                print(f"          剩余的 {n_partitions - self.target_clients} 个数据块本轮将被丢弃/闲置。")
+                print(f"{'!'*50}\n")
+
+        # 3. 加载数据
         train_ds, test_ds = data_utils.get_dataset(ds_config['name'])
         self.test_dataset = test_ds 
-        client_addrs = list(self.clients.keys())
-        partition_indices = data_utils.dirichlet_partition(train_ds, len(client_addrs), ds_config['alpha'])
         
-        # 重置ACK计数器
+        # 4. 执行划分 (根据 n_partitions 切分)
+        # 注意：这里传入的是 n_partitions，而不是 self.target_clients
+        all_partition_indices = data_utils.dirichlet_partition(train_ds, n_partitions, ds_config['alpha'])
+        
+        # 5. 分发给客户端
+        client_addrs = list(self.clients.keys())
+        
+        # 重置ACK
         self.ack_count = 0
         self.ack_event.clear()
         
         print("[*] 开始分发数据分块...")
         for i, addr in enumerate(client_addrs):
             conn = self.clients[addr]['conn']
-            indices = partition_indices[i]
             
-            # 提取真实数据 (Subset -> Tensor List)
+            # [关键] 依次选取对应的数据块
+            # 如果分区多于客户端，这里只会遍历到 len(client_addrs)，多余的 indices 不会被用到
+            indices = all_partition_indices[i]
+            
             local_data = [train_ds[idx] for idx in indices]
             
-            # 发送 header 和 data
+            # 发送数据
+            print(f"    -> 发送给 {self.clients[addr]['id']}: {len(local_data)} 样本 (Partition {i})")
             self._send_msg(conn, "start_data_sync", {"data_len": len(local_data)})
             self._send_data(conn, local_data)
             
@@ -225,30 +263,17 @@ class FLServer:
         time.sleep(1) # 简单缓冲
         print("[√] 配置同步完成")
 
-    def fedavg_aggregate(self):
-        """FedAvg 聚合算法"""
-        print("[Agg] 开始聚合参数...")
+    def aggregate_weights(self):
+        print("[Agg] 执行聚合策略...")
         if not self.client_weights: return
 
-        total_samples = sum([n for _, n in self.client_weights])
-        base_weights = self.client_weights[0][0]
-        avg_weights = copy.deepcopy(base_weights)
+        # 调用算法类的聚合方法
+        new_weights = self.server_algo.aggregate(self.client_weights, self.global_model)
         
-        # 清空基础权重
-        for key in avg_weights.keys():
-            avg_weights[key] = torch.zeros_like(avg_weights[key], dtype=torch.float32)
-
-        # 加权累加
-        for weights, n_samples in self.client_weights:
-            factor = n_samples / total_samples
-            for key in weights.keys():
-                # 确保在CPU上运算
-                avg_weights[key] += weights[key] * factor
-
         # 更新全局模型
-        self.global_model.load_state_dict(avg_weights)
-        self.client_weights = [] # 清空缓存
-        print(f"[Agg] 聚合完成 (Total Samples: {total_samples})")
+        self.global_model.load_state_dict(new_weights)
+        self.client_weights = [] # 清空
+        print("[Agg] 全局模型已更新")
 
 
     def evaluate_global_model(self, current_epoch):
@@ -327,8 +352,7 @@ class FLServer:
             self.ack_event.wait()
             
             # 4. 聚合
-            if self.train_config['algorithm'] == 'FedAvg':
-                self.fedavg_aggregate()
+            self.aggregate_weights()
 
             # 5. [修改] 传入当前 epoch
             self.evaluate_global_model(epoch)
