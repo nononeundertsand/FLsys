@@ -99,7 +99,7 @@ class FLClient:
         print("[√] 模型就绪")
 
     def local_train(self, global_weights):
-        """执行本地训练"""
+        """执行本地训练 (带进度显示)"""
         # 1. 加载全局参数
         self.model.load_state_dict(global_weights)
         self.model.train()
@@ -117,6 +117,8 @@ class FLClient:
             correct = 0
             total = 0
             
+            # 使用 sys.stdout 打印动态进度条 (可选) 或者直接打印 Epoch 结果
+            # 这里为了简约高效，我们打印每个Epoch的详细统计
             for batch_idx, (data, target) in enumerate(train_loader):
                 data, target = data.to(self.device), target.to(self.device)
                 
@@ -126,13 +128,17 @@ class FLClient:
                 loss.backward()
                 self.optimizer.step()
                 
+                # 统计
                 total_loss += loss.item()
                 _, predicted = output.max(1)
                 total += target.size(0)
                 correct += predicted.eq(target).sum().item()
             
+            # 计算本Epoch的平均指标
+            avg_loss = total_loss / len(train_loader)
             acc = 100. * correct / total
-            print(f"    Epoch {epoch+1}: Loss={total_loss/len(train_loader):.4f} | Acc={acc:.2f}%")
+            
+            print(f"    [Epoch {epoch+1}/{epochs}] Loss: {avg_loss:.4f} | Acc: {acc:.2f}%")
 
         return self.model.state_dict()
 

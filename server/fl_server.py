@@ -172,7 +172,8 @@ class FLServer:
         print(f"\n[*] 初始化数据: {ds_config['name']} (Alpha={ds_config['alpha']})")
         
         # 获取数据和划分索引
-        train_ds, _ = data_utils.get_dataset(ds_config['name'])
+        train_ds, test_ds = data_utils.get_dataset(ds_config['name'])
+        self.test_dataset = test_ds 
         client_addrs = list(self.clients.keys())
         partition_indices = data_utils.dirichlet_partition(train_ds, len(client_addrs), ds_config['alpha'])
         
@@ -229,6 +230,44 @@ class FLServer:
         self.client_weights = [] # 清空缓存
         print(f"[Agg] 聚合完成 (Total Samples: {total_samples})")
 
+
+    def evaluate_global_model(self):
+        """[新增] 在服务器端测试集上评估全局模型"""
+        self.global_model.eval() # 切换到评估模式
+        
+        # 创建DataLoader
+        test_loader = torch.utils.data.DataLoader(
+            self.test_dataset, 
+            batch_size=self.train_config['batch_size'], 
+            shuffle=False
+        )
+        
+        correct = 0
+        total = 0
+        total_loss = 0.0
+        criterion = torch.nn.CrossEntropyLoss()
+        
+        print(f"[Eval] 正在评估全局模型 (测试集大小: {len(self.test_dataset)})...")
+        
+        with torch.no_grad(): # 不计算梯度，节省显存
+            for data, target in test_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                outputs = self.global_model(data)
+                loss = criterion(outputs, target)
+                
+                total_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += target.size(0)
+                correct += predicted.eq(target).sum().item()
+        
+        acc = 100. * correct / total
+        avg_loss = total_loss / len(test_loader)
+        
+        print(f"[Eval] 结果: Loss={avg_loss:.4f} | Accuracy={acc:.2f}%")
+        print("-" * 50)
+        
+        self.global_model.train() # 切回训练模式，以免影响后续可能的训练操作
+
     def start_training_loop(self):
         """主训练循环"""
         epochs = self.train_config['global_epochs']
@@ -260,6 +299,9 @@ class FLServer:
             # 4. 聚合
             if self.train_config['algorithm'] == 'FedAvg':
                 self.fedavg_aggregate()
+
+            # 5. [新增] 评估全局模型
+            self.evaluate_global_model()
                 
         print("\n[Done] 全部训练结束！")
 
