@@ -1,18 +1,18 @@
 {
     "host": "0.0.0.0",
     "port": 9999,
-    "target_clients": 1,
+    "target_clients": 3,
     "dataset": {
         "name": "FashionMNIST",
-        "alpha": 0.5,
-        "num_partitions": 10,           
+        "alpha": 0.2,
+        "num_partitions": 3,           
         "require_equal_partitions": false 
     },
     "training": {
         "model_name": "SmallCNN_FashionMNIST",
         "algorithm": "FedAvg",
         "global_epochs": 10,
-        "local_epochs": 1,
+        "local_epochs": 3,
         "batch_size": 32,
         "lr": 0.01,
         "momentum": 0.9,

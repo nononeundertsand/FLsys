@@ -310,8 +310,8 @@ class FLServer:
         print(f"[Eval] Epoch {current_epoch} 结果: Loss={avg_loss:.4f} | Accuracy={acc:.2f}%")
         
         # --- [新增] 保存模型 Checkpoint ---
-        # 文件名格式: global_acc_85.23.pth
-        file_name = f"global_acc_{acc:.2f}.pth"
+        # 文件名格式: global_epoch_10_acc_85.23.pth
+        file_name = f"global_epoch_{current_epoch}_acc_{acc:.2f}.pth"
         save_path = os.path.join(self.checkpoint_dir, file_name)
         
         try:
